@@ -1,10 +1,10 @@
 [package]
 name = "agent-plugin-installer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Native CLI orchestration helpers for installing Codex and Claude agent plugins."
+description = "Native CLI orchestration helpers for managing Codex and Claude agent plugins."
 repository = "https://github.com/lucifer1004/agent-plugin-installer"
 homepage = "https://github.com/lucifer1004/agent-plugin-installer"
 readme = "README.md"

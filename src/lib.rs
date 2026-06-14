@@ -39,6 +39,18 @@ impl AgentRuntime {
         &[Self::Codex, Self::Claude]
     }
 
+    fn readiness_commands(
+        self,
+        operation: AgentPluginOperation,
+    ) -> &'static [&'static [&'static str]] {
+        match operation {
+            AgentPluginOperation::Doctor => self.doctor_commands(),
+            AgentPluginOperation::Install => self.install_commands(),
+            AgentPluginOperation::Update => self.update_commands(),
+            AgentPluginOperation::Uninstall => self.uninstall_commands(),
+        }
+    }
+
     fn doctor_commands(self) -> &'static [&'static [&'static str]] {
         match self {
             Self::Codex => &[
@@ -46,6 +58,7 @@ impl AgentRuntime {
                 &["plugin", "marketplace", "add", "--help"],
                 &["plugin", "marketplace", "upgrade", "--help"],
                 &["plugin", "add", "--help"],
+                &["plugin", "remove", "--help"],
             ],
             Self::Claude => &[
                 &["plugin", "--help"],
@@ -53,7 +66,41 @@ impl AgentRuntime {
                 &["plugin", "marketplace", "update", "--help"],
                 &["plugin", "install", "--help"],
                 &["plugin", "update", "--help"],
+                &["plugin", "uninstall", "--help"],
             ],
+        }
+    }
+
+    fn install_commands(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::Codex => &[
+                &["plugin", "marketplace", "add", "--help"],
+                &["plugin", "add", "--help"],
+            ],
+            Self::Claude => &[
+                &["plugin", "marketplace", "add", "--help"],
+                &["plugin", "install", "--help"],
+            ],
+        }
+    }
+
+    fn update_commands(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::Codex => &[
+                &["plugin", "marketplace", "upgrade", "--help"],
+                &["plugin", "add", "--help"],
+            ],
+            Self::Claude => &[
+                &["plugin", "marketplace", "update", "--help"],
+                &["plugin", "update", "--help"],
+            ],
+        }
+    }
+
+    fn uninstall_commands(self) -> &'static [&'static [&'static str]] {
+        match self {
+            Self::Codex => &[&["plugin", "remove", "--help"]],
+            Self::Claude => &[&["plugin", "uninstall", "--help"]],
         }
     }
 
@@ -64,6 +111,14 @@ impl AgentRuntime {
     fn supports_scopes(self) -> bool {
         matches!(self, Self::Claude)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPluginOperation {
+    Doctor,
+    Install,
+    Update,
+    Uninstall,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +206,33 @@ pub struct UpdateRequest<'a> {
     pub command_timeout: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UninstallRequest<'a> {
+    pub plugin: PluginRef<'a>,
+    pub plugin_scope: Option<&'a str>,
+    pub command_timeout: Duration,
+}
+
+impl<'a> UninstallRequest<'a> {
+    pub fn new(plugin: PluginRef<'a>) -> Self {
+        Self {
+            plugin,
+            plugin_scope: None,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+        }
+    }
+
+    pub fn with_plugin_scope(mut self, scope: &'a str) -> Self {
+        self.plugin_scope = Some(scope);
+        self
+    }
+
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
+    }
+}
+
 impl<'a> UpdateRequest<'a> {
     pub fn new(plugin: PluginRef<'a>) -> Self {
         Self {
@@ -228,8 +310,20 @@ pub fn doctor(runtime: AgentRuntime) -> DoctorOutcome {
 }
 
 pub fn doctor_with_timeout(runtime: AgentRuntime, command_timeout: Duration) -> DoctorOutcome {
+    check_operation_with_timeout(runtime, AgentPluginOperation::Doctor, command_timeout)
+}
+
+pub fn check_operation(runtime: AgentRuntime, operation: AgentPluginOperation) -> DoctorOutcome {
+    check_operation_with_timeout(runtime, operation, DEFAULT_COMMAND_TIMEOUT)
+}
+
+pub fn check_operation_with_timeout(
+    runtime: AgentRuntime,
+    operation: AgentPluginOperation,
+    command_timeout: Duration,
+) -> DoctorOutcome {
     let mut runner = NativeRunner;
-    doctor_with_runner(runtime, command_timeout, &mut runner)
+    check_operation_with_runner(runtime, operation, command_timeout, &mut runner)
 }
 
 pub fn install(
@@ -248,13 +342,22 @@ pub fn update(
     update_with_runner(runtime, request, &mut runner)
 }
 
-fn doctor_with_runner(
+pub fn uninstall(
     runtime: AgentRuntime,
+    request: UninstallRequest<'_>,
+) -> Result<PluginCommandOutcome, AgentPluginError> {
+    let mut runner = NativeRunner;
+    uninstall_with_runner(runtime, request, &mut runner)
+}
+
+fn check_operation_with_runner(
+    runtime: AgentRuntime,
+    operation: AgentPluginOperation,
     command_timeout: Duration,
     runner: &mut impl CommandRunner,
 ) -> DoctorOutcome {
     let mut commands = Vec::new();
-    for command_args in runtime.doctor_commands() {
+    for command_args in runtime.readiness_commands(operation) {
         let args: Vec<OsString> = command_args
             .iter()
             .map(|arg| OsString::from(*arg))
@@ -402,6 +505,37 @@ fn update_with_runner(
     Ok(PluginCommandOutcome { runtime, commands })
 }
 
+fn uninstall_with_runner(
+    runtime: AgentRuntime,
+    request: UninstallRequest<'_>,
+    runner: &mut impl CommandRunner,
+) -> Result<PluginCommandOutcome, AgentPluginError> {
+    validate_uninstall_options(runtime, &request)?;
+    let commands = match runtime {
+        AgentRuntime::Codex => vec![run_agent_command(
+            runtime,
+            "plugin-remove",
+            runtime.cli(),
+            [
+                OsString::from("plugin"),
+                OsString::from("remove"),
+                OsString::from(request.plugin.selector),
+            ],
+            request.command_timeout,
+            runner,
+        )?],
+        AgentRuntime::Claude => vec![run_agent_command(
+            runtime,
+            "plugin-uninstall",
+            runtime.cli(),
+            claude_scoped_plugin_args("uninstall", request.plugin.name, request.plugin_scope),
+            request.command_timeout,
+            runner,
+        )?],
+    };
+    Ok(PluginCommandOutcome { runtime, commands })
+}
+
 fn validate_install_options(
     runtime: AgentRuntime,
     request: &InstallRequest<'_>,
@@ -433,6 +567,20 @@ fn validate_install_options(
 fn validate_update_options(
     runtime: AgentRuntime,
     request: &UpdateRequest<'_>,
+) -> Result<(), AgentPluginError> {
+    if request.plugin_scope.is_some() && !runtime.supports_scopes() {
+        return Err(AgentPluginError::UnsupportedOption {
+            runtime: runtime.id(),
+            option: "plugin_scope",
+            reason: "the native runtime CLI does not expose plugin scopes",
+        });
+    }
+    Ok(())
+}
+
+fn validate_uninstall_options(
+    runtime: AgentRuntime,
+    request: &UninstallRequest<'_>,
 ) -> Result<(), AgentPluginError> {
     if request.plugin_scope.is_some() && !runtime.supports_scopes() {
         return Err(AgentPluginError::UnsupportedOption {
@@ -806,12 +954,66 @@ mod tests {
     }
 
     #[test]
+    fn codex_uninstall_uses_plugin_remove() -> Result<(), AgentPluginError> {
+        let request = UninstallRequest::new(plugin());
+        let mut runner = FakeRunner::successes(1);
+
+        let outcome = uninstall_with_runner(AgentRuntime::Codex, request, &mut runner)?;
+
+        assert_eq!(
+            runner.calls,
+            vec![call("codex", ["plugin", "remove", "veloq@veloq"])]
+        );
+        assert_eq!(outcome.commands, vec!["codex plugin remove veloq@veloq"]);
+        Ok(())
+    }
+
+    #[test]
+    fn claude_uninstall_supports_plugin_scope() -> Result<(), AgentPluginError> {
+        let request = UninstallRequest::new(plugin()).with_plugin_scope("project");
+        let mut runner = FakeRunner::successes(1);
+
+        let outcome = uninstall_with_runner(AgentRuntime::Claude, request, &mut runner)?;
+
+        assert_eq!(
+            runner.calls,
+            vec![call(
+                "claude",
+                ["plugin", "uninstall", "--scope", "project", "veloq"]
+            )]
+        );
+        assert_eq!(
+            outcome.commands,
+            vec!["claude plugin uninstall --scope project veloq"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_options_fail_before_running_commands() {
         let request = InstallRequest::new(MarketplaceSource::local(Path::new(".")), plugin())
             .with_plugin_scope("user");
         let mut runner = FakeRunner::successes(1);
 
         let err = install_with_runner(AgentRuntime::Codex, request, &mut runner);
+
+        assert!(matches!(
+            err,
+            Err(AgentPluginError::UnsupportedOption {
+                runtime: "codex",
+                option: "plugin_scope",
+                ..
+            })
+        ));
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn unsupported_uninstall_options_fail_before_running_commands() {
+        let request = UninstallRequest::new(plugin()).with_plugin_scope("user");
+        let mut runner = FakeRunner::successes(1);
+
+        let err = uninstall_with_runner(AgentRuntime::Codex, request, &mut runner);
 
         assert!(matches!(
             err,
@@ -868,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn failing_uninstall_is_a_structured_error() {
+        let request = UninstallRequest::new(plugin());
+        let mut runner = FakeRunner::from_outputs([Ok(ProcessOutput {
+            success: false,
+            status_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"plugin is not installed".to_vec(),
+        })]);
+
+        let err = uninstall_with_runner(AgentRuntime::Codex, request, &mut runner);
+
+        assert!(matches!(
+            err,
+            Err(AgentPluginError::CliFailed {
+                runtime: "codex",
+                phase: "plugin-remove",
+                status: Some(1),
+                stderr,
+                ..
+            }) if stderr == "plugin is not installed"
+        ));
+    }
+
+    #[test]
     fn command_display_quotes_unsafe_arguments() -> Result<(), AgentPluginError> {
         let request = InstallRequest::new(
             MarketplaceSource::local(Path::new("path with space")),
@@ -889,9 +1115,14 @@ mod tests {
 
     #[test]
     fn doctor_checks_required_subcommands() {
-        let mut runner = FakeRunner::successes(4);
+        let mut runner = FakeRunner::successes(5);
 
-        let outcome = doctor_with_runner(AgentRuntime::Codex, DEFAULT_COMMAND_TIMEOUT, &mut runner);
+        let outcome = check_operation_with_runner(
+            AgentRuntime::Codex,
+            AgentPluginOperation::Doctor,
+            DEFAULT_COMMAND_TIMEOUT,
+            &mut runner,
+        );
 
         assert_eq!(outcome.status, DoctorStatus::Ready);
         assert_eq!(
@@ -901,6 +1132,7 @@ mod tests {
                 call("codex", ["plugin", "marketplace", "add", "--help"]),
                 call("codex", ["plugin", "marketplace", "upgrade", "--help"]),
                 call("codex", ["plugin", "add", "--help"]),
+                call("codex", ["plugin", "remove", "--help"]),
             ]
         );
         assert_eq!(
@@ -910,6 +1142,28 @@ mod tests {
                 "codex plugin marketplace add --help",
                 "codex plugin marketplace upgrade --help",
                 "codex plugin add --help",
+                "codex plugin remove --help",
+            ]
+        );
+    }
+
+    #[test]
+    fn operation_readiness_checks_only_required_subcommands() {
+        let mut runner = FakeRunner::successes(2);
+
+        let outcome = check_operation_with_runner(
+            AgentRuntime::Codex,
+            AgentPluginOperation::Install,
+            DEFAULT_COMMAND_TIMEOUT,
+            &mut runner,
+        );
+
+        assert_eq!(outcome.status, DoctorStatus::Ready);
+        assert_eq!(
+            runner.calls,
+            vec![
+                call("codex", ["plugin", "marketplace", "add", "--help"]),
+                call("codex", ["plugin", "add", "--help"]),
             ]
         );
     }
@@ -926,7 +1180,12 @@ mod tests {
             }),
         ]);
 
-        let outcome = doctor_with_runner(AgentRuntime::Codex, DEFAULT_COMMAND_TIMEOUT, &mut runner);
+        let outcome = check_operation_with_runner(
+            AgentRuntime::Codex,
+            AgentPluginOperation::Doctor,
+            DEFAULT_COMMAND_TIMEOUT,
+            &mut runner,
+        );
 
         assert_eq!(outcome.status, DoctorStatus::Failed);
         assert_eq!(outcome.commands.len(), 2);
