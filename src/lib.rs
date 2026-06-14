@@ -1201,11 +1201,10 @@ mod tests {
     #[test]
     fn native_runner_closes_stdin_and_captures_child_output()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = unique_temp_dir("native-capture")?;
-        let script = temp_dir.join("fake-agent");
-        write_executable(
-            &script,
-            r#"#!/bin/sh
+        let args = [
+            OsString::from("-c"),
+            OsString::from(
+                r#"#!/bin/sh
 if read line; then
   echo "stdin stayed open: $line" >&2
   exit 9
@@ -1214,13 +1213,10 @@ echo "child stdout"
 echo "child stderr" >&2
 exit 7
 "#,
-        )?;
+            ),
+        ];
         let mut runner = NativeRunner;
-        let output = runner.run(
-            script.as_os_str().to_string_lossy().as_ref(),
-            &[],
-            DEFAULT_COMMAND_TIMEOUT,
-        )?;
+        let output = runner.run("sh", &args, DEFAULT_COMMAND_TIMEOUT)?;
 
         assert!(!output.success);
         assert_eq!(output.status_code, Some(7));
@@ -1232,28 +1228,23 @@ exit 7
             String::from_utf8_lossy(&output.stderr).trim(),
             "child stderr"
         );
-        std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
     fn native_runner_times_out() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = unique_temp_dir("native-timeout")?;
-        let script = temp_dir.join("slow-agent");
-        write_executable(
-            &script,
-            r#"#!/bin/sh
+        let args = [
+            OsString::from("-c"),
+            OsString::from(
+                r#"#!/bin/sh
 sleep 2
 echo "too late"
 "#,
-        )?;
+            ),
+        ];
         let mut runner = NativeRunner;
-        let output = runner.run(
-            script.as_os_str().to_string_lossy().as_ref(),
-            &[],
-            Duration::from_millis(50),
-        )?;
+        let output = runner.run("sh", &args, Duration::from_millis(50))?;
 
         assert!(!output.success);
         assert_eq!(output.status_code, None);
@@ -1262,7 +1253,6 @@ echo "too late"
             "stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::fs::remove_dir_all(temp_dir)?;
         Ok(())
     }
 
@@ -1330,28 +1320,5 @@ echo "too late"
                 stderr: Vec::new(),
             }
         }
-    }
-
-    #[cfg(unix)]
-    fn unique_temp_dir(label: &str) -> std::io::Result<std::path::PathBuf> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let dir = std::env::temp_dir().join(format!(
-            "agent-plugin-installer-{label}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&dir)?;
-        Ok(dir)
-    }
-
-    #[cfg(unix)]
-    fn write_executable(path: &Path, body: &str) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::write(path, body)?;
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions)
     }
 }
