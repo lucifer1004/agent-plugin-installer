@@ -1,0 +1,31 @@
+[package]
+name = "agent-plugin-installer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Native CLI orchestration helpers for installing Codex and Claude agent plugins."
+repository = "https://github.com/lucifer1004/agent-plugin-installer"
+homepage = "https://github.com/lucifer1004/agent-plugin-installer"
+readme = "README.md"
+keywords = ["agents", "plugins", "codex", "claude", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+
+[dependencies]
+thiserror = "2"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
