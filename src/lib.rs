@@ -288,6 +288,16 @@ pub enum AgentPluginError {
         cli: &'static str,
     },
 
+    #[error("{runtime} {phase} could not start `{command}`: {reason}")]
+    CliSpawnFailed {
+        runtime: &'static str,
+        phase: &'static str,
+        /// The command that was attempted. It never spawned, so it belongs
+        /// in no executed-command trace.
+        command: String,
+        reason: String,
+    },
+
     #[error("{runtime} {phase} failed while running `{command}`")]
     CliFailed {
         runtime: &'static str,
@@ -367,10 +377,13 @@ fn check_operation_with_runner(
             .map(|arg| OsString::from(*arg))
             .collect();
         let command = render_command(runtime.cli(), &args);
-        commands.push(command.clone());
+        // A command enters the trace only once its process actually ran:
+        // a probe that spawned and failed is evidence, a probe that never
+        // spawned is not.
         match runner.run(runtime.cli(), &args, command_timeout) {
-            Ok(output) if output.success => {}
+            Ok(output) if output.success => commands.push(command),
             Ok(output) => {
+                commands.push(command.clone());
                 return DoctorOutcome {
                     runtime,
                     status: DoctorStatus::Failed,
@@ -394,7 +407,7 @@ fn check_operation_with_runner(
                     runtime,
                     status: DoctorStatus::Failed,
                     commands,
-                    message: Some(format!("required command failed: {command}: {source}")),
+                    message: Some(format!("could not start {command}: {source}")),
                 };
             }
         }
@@ -696,13 +709,13 @@ where
                     cli: program,
                 }
             } else {
-                AgentPluginError::CliFailed {
+                // The process never spawned: this is not a CliFailed, whose
+                // command field names an executed command.
+                AgentPluginError::CliSpawnFailed {
                     runtime: runtime.id(),
                     phase,
                     command: rendered.clone(),
-                    status: None,
-                    stderr: source.to_string(),
-                    completed: Vec::new(),
+                    reason: source.to_string(),
                 }
             }
         })?;
@@ -1096,6 +1109,45 @@ mod tests {
                 stderr,
                 ..
             }) if stderr == "plugin is not installed"
+        ));
+    }
+
+    #[test]
+    fn a_probe_that_never_spawned_stays_out_of_the_trace() {
+        let request = UpdateRequest::new(plugin());
+        let mut runner =
+            FakeRunner::from_outputs([Err(std::io::Error::from(std::io::ErrorKind::NotFound))]);
+
+        let outcome = check_operation_with_runner(
+            AgentRuntime::Codex,
+            AgentPluginOperation::Update,
+            DEFAULT_COMMAND_TIMEOUT,
+            &mut runner,
+        );
+
+        assert_eq!(outcome.status, DoctorStatus::Missing);
+        assert!(
+            outcome.commands.is_empty(),
+            "an unspawned probe is not evidence: {:?}",
+            outcome.commands
+        );
+        let _ = request;
+    }
+
+    #[test]
+    fn a_spawn_failure_is_not_a_ran_command() {
+        let request = UninstallRequest::new(plugin());
+        let mut runner = FakeRunner::from_outputs([Err(std::io::Error::other("fork bomb"))]);
+
+        let err = uninstall_with_runner(AgentRuntime::Codex, request, &mut runner);
+
+        assert!(matches!(
+            err,
+            Err(AgentPluginError::CliSpawnFailed {
+                runtime: "codex",
+                phase: "plugin-remove",
+                ..
+            })
         ));
     }
 

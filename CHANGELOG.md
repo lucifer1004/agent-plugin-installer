@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 - 2026-07-05
+
+- A command enters a trace only after its process actually spawned:
+  readiness probes that never started no longer appear in
+  `DoctorOutcome::commands`, and a spawn failure is the new
+  `CliSpawnFailed` variant instead of a `CliFailed` whose command never
+  ran.
+
 ## 0.3.0 - 2026-07-05
 
 - `CliFailed` carries `completed`: the rendered commands that succeeded
