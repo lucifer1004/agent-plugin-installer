@@ -305,10 +305,6 @@ pub enum AgentPluginError {
         command: String,
         status: Option<i32>,
         stderr: String,
-        /// Rendered commands that completed successfully earlier in the same
-        /// operation: a mid-operation failure leaves those mutations applied,
-        /// and a caller's report needs them to describe the partial state.
-        completed: Vec<String>,
     },
 
     #[error("{runtime} does not support option `{option}`: {reason}")]
@@ -317,6 +313,21 @@ pub enum AgentPluginError {
         option: &'static str,
         reason: &'static str,
     },
+}
+
+/// An operation-level failure: the error that stopped the operation plus
+/// every command that completed before it. Completed commands are evidence
+/// of a partially applied operation whatever the error kind — an executed
+/// failure, a spawn failure, or a vanished CLI — so they travel uniformly
+/// on the operation error instead of on individual variants.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct OperationError {
+    /// Rendered commands that completed successfully before the failure,
+    /// in execution order.
+    pub completed: Vec<String>,
+    #[source]
+    pub error: AgentPluginError,
 }
 
 pub fn doctor(runtime: AgentRuntime) -> DoctorOutcome {
@@ -343,7 +354,7 @@ pub fn check_operation_with_timeout(
 pub fn install(
     runtime: AgentRuntime,
     request: InstallRequest<'_>,
-) -> Result<PluginCommandOutcome, AgentPluginError> {
+) -> Result<PluginCommandOutcome, OperationError> {
     let mut runner = NativeRunner;
     install_with_runner(runtime, request, &mut runner)
 }
@@ -351,7 +362,7 @@ pub fn install(
 pub fn update(
     runtime: AgentRuntime,
     request: UpdateRequest<'_>,
-) -> Result<PluginCommandOutcome, AgentPluginError> {
+) -> Result<PluginCommandOutcome, OperationError> {
     let mut runner = NativeRunner;
     update_with_runner(runtime, request, &mut runner)
 }
@@ -359,7 +370,7 @@ pub fn update(
 pub fn uninstall(
     runtime: AgentRuntime,
     request: UninstallRequest<'_>,
-) -> Result<PluginCommandOutcome, AgentPluginError> {
+) -> Result<PluginCommandOutcome, OperationError> {
     let mut runner = NativeRunner;
     uninstall_with_runner(runtime, request, &mut runner)
 }
@@ -424,8 +435,11 @@ fn install_with_runner(
     runtime: AgentRuntime,
     request: InstallRequest<'_>,
     runner: &mut impl CommandRunner,
-) -> Result<PluginCommandOutcome, AgentPluginError> {
-    validate_install_options(runtime, &request)?;
+) -> Result<PluginCommandOutcome, OperationError> {
+    validate_install_options(runtime, &request).map_err(|error| OperationError {
+        completed: Vec::new(),
+        error,
+    })?;
     let steps = match runtime {
         AgentRuntime::Codex => vec![
             (
@@ -461,44 +475,31 @@ fn run_operation_commands(
     steps: Vec<(&'static str, Vec<OsString>)>,
     command_timeout: Duration,
     runner: &mut impl CommandRunner,
-) -> Result<Vec<String>, AgentPluginError> {
+) -> Result<Vec<String>, OperationError> {
     let mut commands = Vec::with_capacity(steps.len());
     for (phase, args) in steps {
-        let rendered =
-            run_agent_command(runtime, phase, runtime.cli(), args, command_timeout, runner)
-                .map_err(|error| attach_completed(error, &commands))?;
-        commands.push(rendered);
+        match run_agent_command(runtime, phase, runtime.cli(), args, command_timeout, runner) {
+            Ok(rendered) => commands.push(rendered),
+            Err(error) => {
+                return Err(OperationError {
+                    completed: commands,
+                    error,
+                });
+            }
+        }
     }
     Ok(commands)
-}
-
-fn attach_completed(error: AgentPluginError, completed: &[String]) -> AgentPluginError {
-    match error {
-        AgentPluginError::CliFailed {
-            runtime,
-            phase,
-            command,
-            status,
-            stderr,
-            completed: _,
-        } => AgentPluginError::CliFailed {
-            runtime,
-            phase,
-            command,
-            status,
-            stderr,
-            completed: completed.to_vec(),
-        },
-        other => other,
-    }
 }
 
 fn update_with_runner(
     runtime: AgentRuntime,
     request: UpdateRequest<'_>,
     runner: &mut impl CommandRunner,
-) -> Result<PluginCommandOutcome, AgentPluginError> {
-    validate_update_options(runtime, &request)?;
+) -> Result<PluginCommandOutcome, OperationError> {
+    validate_update_options(runtime, &request).map_err(|error| OperationError {
+        completed: Vec::new(),
+        error,
+    })?;
     let steps = match runtime {
         AgentRuntime::Codex => vec![
             (
@@ -533,8 +534,11 @@ fn uninstall_with_runner(
     runtime: AgentRuntime,
     request: UninstallRequest<'_>,
     runner: &mut impl CommandRunner,
-) -> Result<PluginCommandOutcome, AgentPluginError> {
-    validate_uninstall_options(runtime, &request)?;
+) -> Result<PluginCommandOutcome, OperationError> {
+    validate_uninstall_options(runtime, &request).map_err(|error| OperationError {
+        completed: Vec::new(),
+        error,
+    })?;
     let steps = match runtime {
         AgentRuntime::Codex => vec![(
             "plugin-remove",
@@ -728,7 +732,6 @@ where
         command: rendered,
         status: output.status_code,
         stderr: summarize_child_output(&output),
-        completed: Vec::new(),
     })
 }
 
@@ -848,7 +851,7 @@ mod tests {
     use std::collections::VecDeque;
 
     #[test]
-    fn codex_install_uses_marketplace_add_and_plugin_add() -> Result<(), AgentPluginError> {
+    fn codex_install_uses_marketplace_add_and_plugin_add() -> Result<(), OperationError> {
         let plugin = plugin();
         let request = InstallRequest::new(
             MarketplaceSource::new("owner/repo")
@@ -891,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_install_supports_scopes_and_sparse_paths() -> Result<(), AgentPluginError> {
+    fn claude_install_supports_scopes_and_sparse_paths() -> Result<(), OperationError> {
         let plugin = plugin();
         let request = InstallRequest::new(
             MarketplaceSource::new("owner/repo").with_sparse_path(".claude-plugin"),
@@ -930,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_update_can_target_one_marketplace() -> Result<(), AgentPluginError> {
+    fn codex_update_can_target_one_marketplace() -> Result<(), OperationError> {
         let request = UpdateRequest::new(plugin()).with_marketplace_name("veloq");
         let mut runner = FakeRunner::successes(2);
 
@@ -954,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_update_refreshes_marketplace_before_plugin() -> Result<(), AgentPluginError> {
+    fn claude_update_refreshes_marketplace_before_plugin() -> Result<(), OperationError> {
         let request = UpdateRequest::new(plugin())
             .with_marketplace_name("veloq")
             .with_plugin_scope("user");
@@ -973,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_uninstall_uses_plugin_remove() -> Result<(), AgentPluginError> {
+    fn codex_uninstall_uses_plugin_remove() -> Result<(), OperationError> {
         let request = UninstallRequest::new(plugin());
         let mut runner = FakeRunner::successes(1);
 
@@ -988,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_uninstall_supports_plugin_scope() -> Result<(), AgentPluginError> {
+    fn claude_uninstall_supports_plugin_scope() -> Result<(), OperationError> {
         let request = UninstallRequest::new(plugin()).with_plugin_scope("project");
         let mut runner = FakeRunner::successes(1);
 
@@ -1018,9 +1021,12 @@ mod tests {
 
         assert!(matches!(
             err,
-            Err(AgentPluginError::UnsupportedOption {
-                runtime: "codex",
-                option: "plugin_scope",
+            Err(OperationError {
+                error: AgentPluginError::UnsupportedOption {
+                    runtime: "codex",
+                    option: "plugin_scope",
+                    ..
+                },
                 ..
             })
         ));
@@ -1036,9 +1042,12 @@ mod tests {
 
         assert!(matches!(
             err,
-            Err(AgentPluginError::UnsupportedOption {
-                runtime: "codex",
-                option: "plugin_scope",
+            Err(OperationError {
+                error: AgentPluginError::UnsupportedOption {
+                    runtime: "codex",
+                    option: "plugin_scope",
+                    ..
+                },
                 ..
             })
         ));
@@ -1057,10 +1066,13 @@ mod tests {
 
         assert!(matches!(
             err,
-            Err(AgentPluginError::CliMissing {
-                runtime: "codex",
-                cli: "codex"
-            })
+            Err(OperationError {
+                completed,
+                error: AgentPluginError::CliMissing {
+                    runtime: "codex",
+                    cli: "codex"
+                },
+            }) if completed.is_empty()
         ));
     }
 
@@ -1078,13 +1090,16 @@ mod tests {
 
         assert!(matches!(
             err,
-            Err(AgentPluginError::CliFailed {
-                runtime: "codex",
-                phase: "marketplace-upgrade",
-                status: Some(17),
-                stderr,
-                ..
-            }) if stderr == "stderr detail"
+            Err(OperationError {
+                completed,
+                error: AgentPluginError::CliFailed {
+                    runtime: "codex",
+                    phase: "marketplace-upgrade",
+                    status: Some(17),
+                    stderr,
+                    ..
+                },
+            }) if stderr == "stderr detail" && completed.is_empty()
         ));
     }
 
@@ -1102,13 +1117,16 @@ mod tests {
 
         assert!(matches!(
             err,
-            Err(AgentPluginError::CliFailed {
-                runtime: "codex",
-                phase: "plugin-remove",
-                status: Some(1),
-                stderr,
-                ..
-            }) if stderr == "plugin is not installed"
+            Err(OperationError {
+                completed,
+                error: AgentPluginError::CliFailed {
+                    runtime: "codex",
+                    phase: "plugin-remove",
+                    status: Some(1),
+                    stderr,
+                    ..
+                },
+            }) if stderr == "plugin is not installed" && completed.is_empty()
         ));
     }
 
@@ -1143,11 +1161,43 @@ mod tests {
 
         assert!(matches!(
             err,
-            Err(AgentPluginError::CliSpawnFailed {
-                runtime: "codex",
-                phase: "plugin-remove",
-                ..
-            })
+            Err(OperationError {
+                completed,
+                error: AgentPluginError::CliSpawnFailed {
+                    runtime: "codex",
+                    phase: "plugin-remove",
+                    ..
+                },
+            }) if completed.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_spawn_failure_after_a_successful_mutation_keeps_the_prefix() {
+        let request = InstallRequest::new(MarketplaceSource::new("owner/repo"), plugin());
+        let mut runner = FakeRunner::from_outputs([
+            Ok(ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }),
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ]);
+
+        let err = install_with_runner(AgentRuntime::Codex, request, &mut runner);
+
+        // The marketplace mutation completed and is evidence; the unspawned
+        // plugin add is not — but excluding it must not erase the prefix.
+        assert!(matches!(
+            err,
+            Err(OperationError {
+                completed,
+                error: AgentPluginError::CliSpawnFailed {
+                    phase: "plugin-add",
+                    ..
+                },
+            }) if completed == vec!["codex plugin marketplace add owner/repo".to_owned()]
         ));
     }
 
@@ -1175,16 +1225,18 @@ mod tests {
         // the failure must not hide it.
         assert!(matches!(
             err,
-            Err(AgentPluginError::CliFailed {
-                phase: "plugin-add",
+            Err(OperationError {
                 completed,
-                ..
+                error: AgentPluginError::CliFailed {
+                    phase: "plugin-add",
+                    ..
+                },
             }) if completed == vec!["codex plugin marketplace add owner/repo".to_owned()]
         ));
     }
 
     #[test]
-    fn command_display_quotes_unsafe_arguments() -> Result<(), AgentPluginError> {
+    fn command_display_quotes_unsafe_arguments() -> Result<(), OperationError> {
         let request = InstallRequest::new(
             MarketplaceSource::local(Path::new("path with space")),
             plugin(),

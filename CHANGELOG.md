@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 - 2026-07-05
+
+- Operations return `OperationError { completed, error }`: the
+  completed-command prefix travels uniformly on the operation error
+  whatever stopped it, so a spawn failure after a successful mutation no
+  longer erases the mutation from the evidence. `CliFailed` drops its
+  `completed` field.
+
 ## 0.4.0 - 2026-07-05
 
 - A command enters a trace only after its process actually spawned:
