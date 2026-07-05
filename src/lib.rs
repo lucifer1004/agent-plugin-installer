@@ -295,6 +295,10 @@ pub enum AgentPluginError {
         command: String,
         status: Option<i32>,
         stderr: String,
+        /// Rendered commands that completed successfully earlier in the same
+        /// operation: a mid-operation failure leaves those mutations applied,
+        /// and a caller's report needs them to describe the partial state.
+        completed: Vec<String>,
     },
 
     #[error("{runtime} does not support option `{option}`: {reason}")]
@@ -409,49 +413,71 @@ fn install_with_runner(
     runner: &mut impl CommandRunner,
 ) -> Result<PluginCommandOutcome, AgentPluginError> {
     validate_install_options(runtime, &request)?;
-    let commands = match runtime {
+    let steps = match runtime {
         AgentRuntime::Codex => vec![
-            run_agent_command(
-                runtime,
+            (
                 "marketplace-add",
-                runtime.cli(),
                 codex_marketplace_add_args(&request.marketplace),
-                request.command_timeout,
-                runner,
-            )?,
-            run_agent_command(
-                runtime,
+            ),
+            (
                 "plugin-add",
-                runtime.cli(),
-                [
+                vec![
                     OsString::from("plugin"),
                     OsString::from("add"),
                     OsString::from(request.plugin.selector),
                 ],
-                request.command_timeout,
-                runner,
-            )?,
+            ),
         ],
         AgentRuntime::Claude => vec![
-            run_agent_command(
-                runtime,
-                "marketplace-add",
-                runtime.cli(),
-                claude_marketplace_add_args(&request),
-                request.command_timeout,
-                runner,
-            )?,
-            run_agent_command(
-                runtime,
+            ("marketplace-add", claude_marketplace_add_args(&request)),
+            (
                 "plugin-install",
-                runtime.cli(),
                 claude_scoped_plugin_args("install", request.plugin.selector, request.plugin_scope),
-                request.command_timeout,
-                runner,
-            )?,
+            ),
         ],
     };
+    let commands = run_operation_commands(runtime, steps, request.command_timeout, runner)?;
     Ok(PluginCommandOutcome { runtime, commands })
+}
+
+/// Run an operation's native commands in order, accumulating each rendered
+/// command. A mid-operation failure carries the commands that already
+/// completed, so the partially applied state stays auditable.
+fn run_operation_commands(
+    runtime: AgentRuntime,
+    steps: Vec<(&'static str, Vec<OsString>)>,
+    command_timeout: Duration,
+    runner: &mut impl CommandRunner,
+) -> Result<Vec<String>, AgentPluginError> {
+    let mut commands = Vec::with_capacity(steps.len());
+    for (phase, args) in steps {
+        let rendered =
+            run_agent_command(runtime, phase, runtime.cli(), args, command_timeout, runner)
+                .map_err(|error| attach_completed(error, &commands))?;
+        commands.push(rendered);
+    }
+    Ok(commands)
+}
+
+fn attach_completed(error: AgentPluginError, completed: &[String]) -> AgentPluginError {
+    match error {
+        AgentPluginError::CliFailed {
+            runtime,
+            phase,
+            command,
+            status,
+            stderr,
+            completed: _,
+        } => AgentPluginError::CliFailed {
+            runtime,
+            phase,
+            command,
+            status,
+            stderr,
+            completed: completed.to_vec(),
+        },
+        other => other,
+    }
 }
 
 fn update_with_runner(
@@ -460,48 +486,33 @@ fn update_with_runner(
     runner: &mut impl CommandRunner,
 ) -> Result<PluginCommandOutcome, AgentPluginError> {
     validate_update_options(runtime, &request)?;
-    let commands = match runtime {
+    let steps = match runtime {
         AgentRuntime::Codex => vec![
-            run_agent_command(
-                runtime,
+            (
                 "marketplace-upgrade",
-                runtime.cli(),
                 codex_marketplace_upgrade_args(request.marketplace_name),
-                request.command_timeout,
-                runner,
-            )?,
-            run_agent_command(
-                runtime,
+            ),
+            (
                 "plugin-add",
-                runtime.cli(),
-                [
+                vec![
                     OsString::from("plugin"),
                     OsString::from("add"),
                     OsString::from(request.plugin.selector),
                 ],
-                request.command_timeout,
-                runner,
-            )?,
+            ),
         ],
         AgentRuntime::Claude => vec![
-            run_agent_command(
-                runtime,
+            (
                 "marketplace-update",
-                runtime.cli(),
                 claude_marketplace_update_args(request.marketplace_name),
-                request.command_timeout,
-                runner,
-            )?,
-            run_agent_command(
-                runtime,
+            ),
+            (
                 "plugin-update",
-                runtime.cli(),
                 claude_scoped_plugin_args("update", request.plugin.name, request.plugin_scope),
-                request.command_timeout,
-                runner,
-            )?,
+            ),
         ],
     };
+    let commands = run_operation_commands(runtime, steps, request.command_timeout, runner)?;
     Ok(PluginCommandOutcome { runtime, commands })
 }
 
@@ -511,28 +522,21 @@ fn uninstall_with_runner(
     runner: &mut impl CommandRunner,
 ) -> Result<PluginCommandOutcome, AgentPluginError> {
     validate_uninstall_options(runtime, &request)?;
-    let commands = match runtime {
-        AgentRuntime::Codex => vec![run_agent_command(
-            runtime,
+    let steps = match runtime {
+        AgentRuntime::Codex => vec![(
             "plugin-remove",
-            runtime.cli(),
-            [
+            vec![
                 OsString::from("plugin"),
                 OsString::from("remove"),
                 OsString::from(request.plugin.selector),
             ],
-            request.command_timeout,
-            runner,
-        )?],
-        AgentRuntime::Claude => vec![run_agent_command(
-            runtime,
+        )],
+        AgentRuntime::Claude => vec![(
             "plugin-uninstall",
-            runtime.cli(),
             claude_scoped_plugin_args("uninstall", request.plugin.name, request.plugin_scope),
-            request.command_timeout,
-            runner,
-        )?],
+        )],
     };
+    let commands = run_operation_commands(runtime, steps, request.command_timeout, runner)?;
     Ok(PluginCommandOutcome { runtime, commands })
 }
 
@@ -698,6 +702,7 @@ where
                     command: rendered.clone(),
                     status: None,
                     stderr: source.to_string(),
+                    completed: Vec::new(),
                 }
             }
         })?;
@@ -710,6 +715,7 @@ where
         command: rendered,
         status: output.status_code,
         stderr: summarize_child_output(&output),
+        completed: Vec::new(),
     })
 }
 
@@ -1090,6 +1096,38 @@ mod tests {
                 stderr,
                 ..
             }) if stderr == "plugin is not installed"
+        ));
+    }
+
+    #[test]
+    fn a_mid_operation_failure_reports_the_completed_commands() {
+        let request = InstallRequest::new(MarketplaceSource::new("owner/repo"), plugin());
+        let mut runner = FakeRunner::from_outputs([
+            Ok(ProcessOutput {
+                success: true,
+                status_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }),
+            Ok(ProcessOutput {
+                success: false,
+                status_code: Some(7),
+                stdout: Vec::new(),
+                stderr: b"plugin add exploded".to_vec(),
+            }),
+        ]);
+
+        let err = install_with_runner(AgentRuntime::Codex, request, &mut runner);
+
+        // The marketplace registration succeeded and mutated the runtime;
+        // the failure must not hide it.
+        assert!(matches!(
+            err,
+            Err(AgentPluginError::CliFailed {
+                phase: "plugin-add",
+                completed,
+                ..
+            }) if completed == vec!["codex plugin marketplace add owner/repo".to_owned()]
         ));
     }
 

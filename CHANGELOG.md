@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 - 2026-07-05
+
+- `CliFailed` carries `completed`: the rendered commands that succeeded
+  earlier in the same operation, so a mid-operation failure reports the
+  partially applied state instead of hiding successful mutations.
+
 ## 0.2.0 - 2026-06-14
 
 - Added Codex and Claude plugin uninstall helpers.
