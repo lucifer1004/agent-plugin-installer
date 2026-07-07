@@ -4,13 +4,24 @@
 //! JSON envelope, release process, or package validation rules. Callers
 //! provide marketplace/plugin metadata; the crate invokes the selected
 //! agent runtime's public CLI and returns command summaries or structured
-//! errors.
+//! errors. Batch helpers add all-runtime validation and preflight gates while
+//! leaving output policy with the caller.
+
+mod batch;
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+pub use batch::{
+    BatchFailure, BatchOperationError, BatchOperationReport, BatchResult, BatchRuntimeOutcome,
+    BatchSkipReason, BatchStatus, FailurePolicy, doctor_many, install_many, uninstall_many,
+    update_many,
+};
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -110,6 +121,71 @@ impl AgentRuntime {
 
     fn supports_scopes(self) -> bool {
         matches!(self, Self::Claude)
+    }
+}
+
+/// Selects one supported agent runtime or every supported runtime.
+///
+/// Host applications own whether this is a positional argument, an option,
+/// or a configuration value. Enable the `clap` feature to use this type
+/// directly as a `clap::ValueEnum`.
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentSelector {
+    Codex,
+    Claude,
+    All,
+}
+
+impl AgentSelector {
+    pub fn runtimes(self) -> &'static [AgentRuntime] {
+        match self {
+            Self::Codex => &[AgentRuntime::Codex],
+            Self::Claude => &[AgentRuntime::Claude],
+            Self::All => AgentRuntime::supported(),
+        }
+    }
+}
+
+impl From<AgentRuntime> for AgentSelector {
+    fn from(runtime: AgentRuntime) -> Self {
+        match runtime {
+            AgentRuntime::Codex => Self::Codex,
+            AgentRuntime::Claude => Self::Claude,
+        }
+    }
+}
+
+impl fmt::Display for AgentSelector {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::All => "all",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+#[error("unsupported agent selector `{value}`; expected codex, claude, or all")]
+pub struct ParseAgentSelectorError {
+    value: String,
+}
+
+impl FromStr for AgentSelector {
+    type Err = ParseAgentSelectorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            "all" => Ok(Self::All),
+            _ => Err(ParseAgentSelectorError {
+                value: value.to_owned(),
+            }),
+        }
     }
 }
 
@@ -280,7 +356,7 @@ pub struct PluginCommandOutcome {
     pub commands: Vec<String>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AgentPluginError {
     #[error("{runtime} CLI `{cli}` is not available on PATH")]
     CliMissing {
@@ -320,7 +396,7 @@ pub enum AgentPluginError {
 /// of a partially applied operation whatever the error kind — an executed
 /// failure, a spawn failure, or a vanished CLI — so they travel uniformly
 /// on the operation error instead of on individual variants.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("{error}")]
 pub struct OperationError {
     /// Rendered commands that completed successfully before the failure,
@@ -405,7 +481,9 @@ fn check_operation_with_runner(
                     )),
                 };
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(CommandRunError::Spawn(source))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
                 return DoctorOutcome {
                     runtime,
                     status: DoctorStatus::Missing,
@@ -413,12 +491,23 @@ fn check_operation_with_runner(
                     message: Some(format!("`{}` is not available on PATH", runtime.cli())),
                 };
             }
-            Err(source) => {
+            Err(CommandRunError::Spawn(source)) => {
                 return DoctorOutcome {
                     runtime,
                     status: DoctorStatus::Failed,
                     commands,
                     message: Some(format!("could not start {command}: {source}")),
+                };
+            }
+            Err(CommandRunError::Supervision(source)) => {
+                commands.push(command.clone());
+                return DoctorOutcome {
+                    runtime,
+                    status: DoctorStatus::Failed,
+                    commands,
+                    message: Some(format!(
+                        "could not monitor spawned command {command}: {source}"
+                    )),
                 };
             }
         }
@@ -706,21 +795,31 @@ where
     let rendered = render_command(program, &args);
     let output = runner
         .run(program, &args, command_timeout)
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                AgentPluginError::CliMissing {
-                    runtime: runtime.id(),
-                    cli: program,
+        .map_err(|failure| {
+            match failure {
+                CommandRunError::Spawn(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    AgentPluginError::CliMissing {
+                        runtime: runtime.id(),
+                        cli: program,
+                    }
                 }
-            } else {
-                // The process never spawned: this is not a CliFailed, whose
-                // command field names an executed command.
-                AgentPluginError::CliSpawnFailed {
+                CommandRunError::Spawn(source) => {
+                    // The process never spawned: this is not a CliFailed, whose
+                    // command field names an executed command.
+                    AgentPluginError::CliSpawnFailed {
+                        runtime: runtime.id(),
+                        phase,
+                        command: rendered.clone(),
+                        reason: source.to_string(),
+                    }
+                }
+                CommandRunError::Supervision(source) => AgentPluginError::CliFailed {
                     runtime: runtime.id(),
                     phase,
                     command: rendered.clone(),
-                    reason: source.to_string(),
-                }
+                    status: None,
+                    stderr: format!("could not monitor spawned command: {source}"),
+                },
             }
         })?;
     if output.success {
@@ -735,13 +834,21 @@ where
     })
 }
 
+#[derive(Debug, Error)]
+enum CommandRunError {
+    #[error("process did not spawn: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("spawned process could not be monitored: {0}")]
+    Supervision(#[source] std::io::Error),
+}
+
 trait CommandRunner {
     fn run(
         &mut self,
         program: &str,
         args: &[OsString],
         command_timeout: Duration,
-    ) -> std::io::Result<ProcessOutput>;
+    ) -> Result<ProcessOutput, CommandRunError>;
 }
 
 struct NativeRunner;
@@ -752,21 +859,47 @@ impl CommandRunner for NativeRunner {
         program: &str,
         args: &[OsString],
         command_timeout: Duration,
-    ) -> std::io::Result<ProcessOutput> {
+    ) -> Result<ProcessOutput, CommandRunError> {
         let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .map_err(CommandRunError::Spawn)?;
         let start = Instant::now();
         loop {
-            if child.try_wait()?.is_some() {
-                return child.wait_with_output().map(ProcessOutput::from);
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child
+                        .wait_with_output()
+                        .map(ProcessOutput::from)
+                        .map_err(CommandRunError::Supervision);
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    // Avoid leaving a known-running child behind when process
+                    // supervision itself fails. The original error remains
+                    // the useful diagnostic even if best-effort cleanup fails.
+                    if child.kill().is_ok() {
+                        let _ = child.wait();
+                    }
+                    return Err(CommandRunError::Supervision(source));
+                }
             }
             if start.elapsed() >= command_timeout {
-                let _ = child.kill();
-                let mut output = child.wait_with_output().map(ProcessOutput::from)?;
+                if let Err(source) = child.kill() {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => {
+                            return Err(CommandRunError::Supervision(source));
+                        }
+                    }
+                }
+                let mut output = child
+                    .wait_with_output()
+                    .map(ProcessOutput::from)
+                    .map_err(CommandRunError::Supervision)?;
                 output.success = false;
                 output.status_code = None;
                 output.stderr = format!(
@@ -849,6 +982,38 @@ fn truncate_message(message: String) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn agent_selector_parses_and_expands_without_a_cli_framework() {
+        assert_eq!("codex".parse(), Ok(AgentSelector::Codex));
+        assert_eq!("claude".parse(), Ok(AgentSelector::Claude));
+        assert_eq!("all".parse(), Ok(AgentSelector::All));
+        assert_eq!(
+            AgentSelector::All.runtimes(),
+            [AgentRuntime::Codex, AgentRuntime::Claude]
+        );
+        assert_eq!(AgentSelector::Claude.to_string(), "claude");
+        assert!("other".parse::<AgentSelector>().is_err());
+    }
+
+    #[cfg(feature = "clap")]
+    #[test]
+    fn clap_feature_exposes_selector_as_a_value_enum() {
+        use clap::ValueEnum;
+
+        assert_eq!(
+            AgentSelector::value_variants(),
+            [
+                AgentSelector::Codex,
+                AgentSelector::Claude,
+                AgentSelector::All,
+            ]
+        );
+        assert_eq!(
+            <AgentSelector as clap::ValueEnum>::from_str("codex", true),
+            Ok(AgentSelector::Codex)
+        );
+    }
 
     #[test]
     fn codex_install_uses_marketplace_add_and_plugin_add() -> Result<(), OperationError> {
@@ -1057,9 +1222,8 @@ mod tests {
     #[test]
     fn missing_cli_returns_structured_error() {
         let request = UpdateRequest::new(plugin());
-        let mut runner = FakeRunner::from_outputs([Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "missing",
+        let mut runner = FakeRunner::from_outputs([Err(CommandRunError::Spawn(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
         ))]);
 
         let err = update_with_runner(AgentRuntime::Codex, request, &mut runner);
@@ -1133,8 +1297,9 @@ mod tests {
     #[test]
     fn a_probe_that_never_spawned_stays_out_of_the_trace() {
         let request = UpdateRequest::new(plugin());
-        let mut runner =
-            FakeRunner::from_outputs([Err(std::io::Error::from(std::io::ErrorKind::NotFound))]);
+        let mut runner = FakeRunner::from_outputs([Err(CommandRunError::Spawn(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ))]);
 
         let outcome = check_operation_with_runner(
             AgentRuntime::Codex,
@@ -1155,7 +1320,9 @@ mod tests {
     #[test]
     fn a_spawn_failure_is_not_a_ran_command() {
         let request = UninstallRequest::new(plugin());
-        let mut runner = FakeRunner::from_outputs([Err(std::io::Error::other("fork bomb"))]);
+        let mut runner = FakeRunner::from_outputs([Err(CommandRunError::Spawn(
+            std::io::Error::other("fork bomb"),
+        ))]);
 
         let err = uninstall_with_runner(AgentRuntime::Codex, request, &mut runner);
 
@@ -1182,7 +1349,9 @@ mod tests {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             }),
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Err(CommandRunError::Spawn(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
         ]);
 
         let err = install_with_runner(AgentRuntime::Codex, request, &mut runner);
@@ -1232,6 +1401,54 @@ mod tests {
                     ..
                 },
             }) if completed == vec!["codex plugin marketplace add owner/repo".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn a_supervision_failure_is_an_executed_command() {
+        let request = UninstallRequest::new(plugin());
+        let mut runner = FakeRunner::from_outputs([Err(CommandRunError::Supervision(
+            std::io::Error::other("wait failed"),
+        ))]);
+
+        let err = uninstall_with_runner(AgentRuntime::Codex, request, &mut runner);
+
+        assert!(matches!(
+            err,
+            Err(OperationError {
+                completed,
+                error: AgentPluginError::CliFailed {
+                    runtime: "codex",
+                    phase: "plugin-remove",
+                    command,
+                    status: None,
+                    stderr,
+                },
+            }) if completed.is_empty()
+                && command == "codex plugin remove veloq@veloq"
+                && stderr.contains("wait failed")
+        ));
+    }
+
+    #[test]
+    fn a_probe_supervision_failure_enters_the_trace() {
+        let mut runner = FakeRunner::from_outputs([Err(CommandRunError::Supervision(
+            std::io::Error::other("wait failed"),
+        ))]);
+
+        let outcome = check_operation_with_runner(
+            AgentRuntime::Codex,
+            AgentPluginOperation::Uninstall,
+            DEFAULT_COMMAND_TIMEOUT,
+            &mut runner,
+        );
+
+        assert_eq!(outcome.status, DoctorStatus::Failed);
+        assert_eq!(outcome.commands, ["codex plugin remove --help"]);
+        assert!(matches!(
+            outcome.message.as_deref(),
+            Some(message) if message.contains("could not monitor spawned command")
+                && message.contains("wait failed")
         ));
     }
 
@@ -1414,7 +1631,7 @@ echo "too late"
 
     struct FakeRunner {
         calls: Vec<(String, Vec<String>)>,
-        outputs: VecDeque<std::io::Result<ProcessOutput>>,
+        outputs: VecDeque<Result<ProcessOutput, CommandRunError>>,
     }
 
     impl FakeRunner {
@@ -1426,7 +1643,9 @@ echo "too late"
             }
         }
 
-        fn from_outputs<const N: usize>(outputs: [std::io::Result<ProcessOutput>; N]) -> Self {
+        fn from_outputs<const N: usize>(
+            outputs: [Result<ProcessOutput, CommandRunError>; N],
+        ) -> Self {
             Self {
                 calls: Vec::new(),
                 outputs: VecDeque::from(outputs),
@@ -1440,16 +1659,18 @@ echo "too late"
             program: &str,
             args: &[OsString],
             _command_timeout: Duration,
-        ) -> std::io::Result<ProcessOutput> {
+        ) -> Result<ProcessOutput, CommandRunError> {
             self.calls.push((
                 program.to_string(),
                 args.iter()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect(),
             ));
-            self.outputs
-                .pop_front()
-                .unwrap_or_else(|| Err(std::io::Error::other("missing fake output")))
+            self.outputs.pop_front().unwrap_or_else(|| {
+                Err(CommandRunError::Supervision(std::io::Error::other(
+                    "missing fake output",
+                )))
+            })
         }
     }
 

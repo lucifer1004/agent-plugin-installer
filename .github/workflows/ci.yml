@@ -35,11 +35,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Test
+      - name: Test default features
         run: cargo test --all-targets
 
-      - name: Clippy
+      - name: Test all features
+        run: cargo test --all-targets --all-features
+
+      - name: Clippy default features
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy all features
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Package
         run: cargo package

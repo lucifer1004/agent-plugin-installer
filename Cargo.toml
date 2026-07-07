@@ -19,7 +19,12 @@ include = [
 ]
 
 [dependencies]
+clap = { version = "4", default-features = false, features = ["derive", "std"], optional = true }
 thiserror = "2"
+
+[features]
+default = []
+clap = ["dep:clap"]
 
 [lints.clippy]
 unwrap_used = "deny"

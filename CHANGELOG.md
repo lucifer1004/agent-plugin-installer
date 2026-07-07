@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Added `AgentSelector` with framework-independent parsing and an optional
+  `clap` feature that implements `clap::ValueEnum` without changing host CLI
+  shape.
+- Added `doctor_many`, `install_many`, `update_many`, and `uninstall_many`.
+  Batch mutations validate and preflight every selected runtime before writes,
+  preserve executed-command traces, and expose explicit stop-or-continue
+  failure policy. Runtime request providers support different native options,
+  and unsuccessful batches return an error that retains the complete report.
+- Distinguished process spawn failures from supervision failures after spawn,
+  so every command that actually starts remains in readiness and mutation
+  traces.
+- Batch failures distinguish request validation, runtime preflight, and native
+  operation stages. New batch result types are non-exhaustive for future
+  compatible extension.
+
 ## 0.5.0 - 2026-07-05
 
 - Operations return `OperationError { completed, error }`: the
